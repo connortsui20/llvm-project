@@ -56131,6 +56131,87 @@ static SDValue combinePMULH(SDValue Src, EVT VT, const SDLoc &DL,
                      DAG.getShiftAmountConstant(AdditionalShift, VT, DL));
 }
 
+// Recover high-half multiplies when InstCombine factors the shift and truncation
+// out of an OR reduction. Require i16 inputs or constants so the reduction does
+// not introduce input packing or widening.
+static SDValue combinePMULHOrReduction(SDValue Src, EVT VT, const SDLoc &DL,
+                                       SelectionDAG &DAG,
+                                       const X86Subtarget &Subtarget) {
+  using namespace llvm::SDPatternMatch;
+
+  if (!Subtarget.hasSSE2() || !VT.isVectorOf(MVT::i16))
+    return SDValue();
+
+  EVT WideVT = Src.getValueType();
+  if (WideVT.getVectorElementType().getSizeInBits() < 32)
+    return SDValue();
+
+  if (Src.getOpcode() != ISD::SRL || !Src.hasOneUse() ||
+      Src.getOperand(0).getOpcode() != ISD::OR)
+    return SDValue();
+
+  // Further shifts can expose sign bits above bit 31 of a widened product.
+  if (!sd_match(Src.getOperand(1), m_SpecificInt(16)))
+    return SDValue();
+
+  auto isI16ExtensionOrConstant = [](SDValue Input) {
+    if (Input.getOpcode() == ISD::SIGN_EXTEND ||
+        Input.getOpcode() == ISD::ZERO_EXTEND)
+      return Input.getOperand(0).getScalarValueSizeInBits() == 16;
+    return ISD::isBuildVectorOfConstantSDNodes(Input.getNode());
+  };
+
+  // Eight products cover a 64-element reduction at eight lanes per vector.
+  constexpr unsigned MaxProducts = 8;
+  SmallVector<SDValue, MaxProducts> PendingNodes{Src.getOperand(0)};
+  SmallVector<SDValue, MaxProducts> WideProducts;
+
+  while (!PendingNodes.empty()) {
+    SDValue Node = PendingNodes.pop_back_val();
+
+    // Sharing a product or OR node would retain the wide computation.
+    if (!Node.hasOneUse())
+      return SDValue();
+
+    // The popped node and each pending node need at least one product.
+    size_t MinimumProducts = PendingNodes.size() + WideProducts.size() + 1;
+    if (MinimumProducts > MaxProducts)
+      return SDValue();
+
+    if (Node.getOpcode() == ISD::OR) {
+      PendingNodes.push_back(Node.getOperand(0));
+      PendingNodes.push_back(Node.getOperand(1));
+      continue;
+    }
+
+    if (Node.getOpcode() != ISD::MUL)
+      return SDValue();
+
+    // Packing or widening every input can cost more than one final truncation.
+    if (!isI16ExtensionOrConstant(Node.getOperand(0)) ||
+        !isI16ExtensionOrConstant(Node.getOperand(1)))
+      return SDValue();
+
+    WideProducts.push_back(Node);
+  }
+
+  SDValue Result;
+  for (SDValue Product : WideProducts) {
+    SDValue Shifted =
+        DAG.getNode(ISD::SRL, DL, WideVT, Product, Src.getOperand(1));
+    SDValue HighHalf = combinePMULH(Shifted, VT, DL, DAG, Subtarget);
+    if (!HighHalf)
+      return SDValue();
+
+    if (Result)
+      Result = DAG.getNode(ISD::OR, DL, VT, Result, HighHalf);
+    else
+      Result = HighHalf;
+  }
+
+  return Result;
+}
+
 // Attempt to match PMADDUBSW, which multiplies corresponding unsigned bytes
 // from one vector with signed bytes from another vector, adds together
 // adjacent pairs of 16-bit products, and saturates the result before
@@ -56280,6 +56361,8 @@ static SDValue combineTruncate(SDNode *N, SelectionDAG &DAG,
 
   // Try to combine PMULHUW/PMULHW for vXi16.
   if (SDValue V = combinePMULH(Src, VT, DL, DAG, Subtarget))
+    return V;
+  if (SDValue V = combinePMULHOrReduction(Src, VT, DL, DAG, Subtarget))
     return V;
 
   // Fold trunc(srl(load(p),amt)) -> load(p+amt/8)
